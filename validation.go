@@ -30,6 +30,7 @@ import (
 	"math/big"
 	"reflect"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -57,18 +58,18 @@ func (v *Schema) Validate(l JSONLoader) (*Result, error) {
 func (v *Schema) validateDocument(root interface{}) *Result {
 	result := &Result{}
 	context := NewJsonContext(STRING_CONTEXT_ROOT, nil)
-	v.rootSchema.validateRecursive(v.rootSchema, root, result, context)
+	v.rootSchema.validateRecursive(v.rootSchema, root, result, context, nil)
 	return result
 }
 
-func (v *subSchema) subValidateWithContext(document interface{}, context *JsonContext) *Result {
+func (v *subSchema) subValidateWithContext(document interface{}, context *JsonContext, extraSubSchemas []*subSchema) *Result {
 	result := &Result{}
-	v.validateRecursive(v, document, result, context)
+	v.validateRecursive(v, document, result, context, extraSubSchemas)
 	return result
 }
 
 // Walker function to validate the json recursively against the subSchema
-func (v *subSchema) validateRecursive(currentSubSchema *subSchema, currentNode interface{}, result *Result, context *JsonContext) {
+func (v *subSchema) validateRecursive(currentSubSchema *subSchema, currentNode interface{}, result *Result, context *JsonContext, extraSubSchemas []*subSchema) {
 
 	if internalLogEnabled {
 		internalLog("validateRecursive %s", context.String())
@@ -90,7 +91,7 @@ func (v *subSchema) validateRecursive(currentSubSchema *subSchema, currentNode i
 
 	// Handle referenced schemas, returns directly when a $ref is found
 	if currentSubSchema.refSchema != nil {
-		v.validateRecursive(currentSubSchema.refSchema, currentNode, result, context)
+		v.validateRecursive(currentSubSchema.refSchema, currentNode, result, context, extraSubSchemas)
 		return
 	}
 
@@ -174,7 +175,7 @@ func (v *subSchema) validateRecursive(currentSubSchema *subSchema, currentNode i
 
 				currentSubSchema.validateSchema(currentSubSchema, castCurrentNode, result, context)
 
-				v.validateArray(currentSubSchema, castCurrentNode, result, context)
+				v.validateArray(currentSubSchema, castCurrentNode, result, context, extraSubSchemas)
 				v.validateCommon(currentSubSchema, castCurrentNode, result, context)
 
 			// Map => JSON object
@@ -200,14 +201,14 @@ func (v *subSchema) validateRecursive(currentSubSchema *subSchema, currentNode i
 
 				currentSubSchema.validateSchema(currentSubSchema, castCurrentNode, result, context)
 
-				v.validateObject(currentSubSchema, castCurrentNode, result, context)
+				v.validateObject(currentSubSchema, castCurrentNode, result, context, extraSubSchemas)
 				v.validateCommon(currentSubSchema, castCurrentNode, result, context)
 
 				for _, pSchema := range currentSubSchema.propertiesChildren {
 					nextNode, ok := castCurrentNode[pSchema.property]
 					if ok {
 						subContext := NewJsonContext(pSchema.property, context)
-						v.validateRecursive(pSchema, nextNode, result, subContext)
+						v.validateRecursive(pSchema, nextNode, result, subContext, extraSubSchemas)
 					}
 				}
 
@@ -268,6 +269,7 @@ func (v *subSchema) validateRecursive(currentSubSchema *subSchema, currentNode i
 
 // Different kinds of validation there, subSchema / common / array / object / string...
 func (v *subSchema) validateSchema(currentSubSchema *subSchema, currentNode interface{}, result *Result, context *JsonContext) {
+	var extraSubSchemas []*subSchema
 
 	if internalLogEnabled {
 		internalLog("validateSchema %s", context.String())
@@ -278,15 +280,24 @@ func (v *subSchema) validateSchema(currentSubSchema *subSchema, currentNode inte
 
 		validatedAnyOf := false
 		var bestValidationResult *Result
+		var bestValidationSchema *subSchema
+
+		// Also consider other "anyOf" schemas and the list of "allOf"/"oneOf"
+		// sub-schemas when checking for valid properties.
+		testSubSchemas := make([]*subSchema, 0, len(extraSubSchemas)+len(currentSubSchema.oneOf)+len(currentSubSchema.anyOf)+len(currentSubSchema.allOf))
+		testSubSchemas = append(testSubSchemas, extraSubSchemas...)
+		testSubSchemas = append(testSubSchemas, currentSubSchema.oneOf...)
+		testSubSchemas = append(testSubSchemas, currentSubSchema.anyOf...)
+		testSubSchemas = append(testSubSchemas, currentSubSchema.allOf...)
 
 		for _, anyOfSchema := range currentSubSchema.anyOf {
-			if !validatedAnyOf {
-				validationResult := anyOfSchema.subValidateWithContext(currentNode, context)
-				validatedAnyOf = validationResult.Valid()
-
-				if !validatedAnyOf && (bestValidationResult == nil || validationResult.score > bestValidationResult.score) {
-					bestValidationResult = validationResult
-				}
+			validationResult := anyOfSchema.subValidateWithContext(currentNode, context, testSubSchemas)
+			if validationResult.Valid() {
+				validatedAnyOf = true
+				extraSubSchemas = append(extraSubSchemas, anyOfSchema)
+			} else if !validatedAnyOf && (bestValidationResult == nil || validationResult.score > bestValidationResult.score) {
+				bestValidationResult = validationResult
+				bestValidationSchema = anyOfSchema
 			}
 		}
 		if !validatedAnyOf {
@@ -297,6 +308,8 @@ func (v *subSchema) validateSchema(currentSubSchema *subSchema, currentNode inte
 				// add error messages of closest matching subSchema as
 				// that's probably the one the user was trying to match
 				result.mergeErrors(bestValidationResult)
+
+				extraSubSchemas = append(extraSubSchemas, bestValidationSchema)
 			}
 		}
 	}
@@ -305,13 +318,23 @@ func (v *subSchema) validateSchema(currentSubSchema *subSchema, currentNode inte
 
 		nbValidated := 0
 		var bestValidationResult *Result
+		var bestValidationSchema *subSchema
+
+		// Also consider the list of previously-matched "anyOf" sub-schemas
+		// and every "allOf" sub-schema for valid properties.
+		// checking for fields from other schemas.
+		testSubSchemas := make([]*subSchema, 0, len(extraSubSchemas)+len(currentSubSchema.allOf))
+		testSubSchemas = append(testSubSchemas, extraSubSchemas...)
+		testSubSchemas = append(testSubSchemas, currentSubSchema.allOf...)
 
 		for _, oneOfSchema := range currentSubSchema.oneOf {
-			validationResult := oneOfSchema.subValidateWithContext(currentNode, context)
+			validationResult := oneOfSchema.subValidateWithContext(currentNode, context, testSubSchemas)
 			if validationResult.Valid() {
 				nbValidated++
+				extraSubSchemas = append(extraSubSchemas, oneOfSchema)
 			} else if nbValidated == 0 && (bestValidationResult == nil || validationResult.score > bestValidationResult.score) {
 				bestValidationResult = validationResult
+				bestValidationSchema = oneOfSchema
 			}
 		}
 
@@ -323,6 +346,8 @@ func (v *subSchema) validateSchema(currentSubSchema *subSchema, currentNode inte
 				// add error messages of closest matching subSchema as
 				// that's probably the one the user was trying to match
 				result.mergeErrors(bestValidationResult)
+
+				extraSubSchemas = append(extraSubSchemas, bestValidationSchema)
 			}
 		}
 
@@ -331,8 +356,18 @@ func (v *subSchema) validateSchema(currentSubSchema *subSchema, currentNode inte
 	if len(currentSubSchema.allOf) > 0 {
 		nbValidated := 0
 
+		// The other "allOf" schemas have to be considered for valid properties
+		// as well under `"additionalProperties":false`.  This will include the
+		// current schema in the list as well, but that isn't worth the
+		// complexity to avoid because if the field wasn't found in the current
+		// schema then checking it again as one of the "allOf" schemas won't
+		// either.
+		testSubSchemas := make([]*subSchema, 0, len(extraSubSchemas)+len(currentSubSchema.allOf))
+		testSubSchemas = append(testSubSchemas, extraSubSchemas...)
+		testSubSchemas = append(testSubSchemas, currentSubSchema.allOf...)
+
 		for _, allOfSchema := range currentSubSchema.allOf {
-			validationResult := allOfSchema.subValidateWithContext(currentNode, context)
+			validationResult := allOfSchema.subValidateWithContext(currentNode, context, testSubSchemas)
 			if validationResult.Valid() {
 				nbValidated++
 			}
@@ -345,7 +380,7 @@ func (v *subSchema) validateSchema(currentSubSchema *subSchema, currentNode inte
 	}
 
 	if currentSubSchema.not != nil {
-		validationResult := currentSubSchema.not.subValidateWithContext(currentNode, context)
+		validationResult := currentSubSchema.not.subValidateWithContext(currentNode, context, extraSubSchemas)
 		if validationResult.Valid() {
 			result.addInternalError(new(NumberNotError), context, currentNode, ErrorDetails{})
 		}
@@ -370,7 +405,7 @@ func (v *subSchema) validateSchema(currentSubSchema *subSchema, currentNode inte
 						}
 
 					case *subSchema:
-						dependency.validateRecursive(dependency, currentNode, result, context)
+						dependency.validateRecursive(dependency, currentNode, result, context, extraSubSchemas)
 					}
 				}
 			}
@@ -378,16 +413,16 @@ func (v *subSchema) validateSchema(currentSubSchema *subSchema, currentNode inte
 	}
 
 	if currentSubSchema._if != nil {
-		validationResultIf := currentSubSchema._if.subValidateWithContext(currentNode, context)
+		validationResultIf := currentSubSchema._if.subValidateWithContext(currentNode, context, extraSubSchemas)
 		if currentSubSchema._then != nil && validationResultIf.Valid() {
-			validationResultThen := currentSubSchema._then.subValidateWithContext(currentNode, context)
+			validationResultThen := currentSubSchema._then.subValidateWithContext(currentNode, context, extraSubSchemas)
 			if !validationResultThen.Valid() {
 				result.addInternalError(new(ConditionThenError), context, currentNode, ErrorDetails{})
 				result.mergeErrors(validationResultThen)
 			}
 		}
 		if currentSubSchema._else != nil && !validationResultIf.Valid() {
-			validationResultElse := currentSubSchema._else.subValidateWithContext(currentNode, context)
+			validationResultElse := currentSubSchema._else.subValidateWithContext(currentNode, context, extraSubSchemas)
 			if !validationResultElse.Valid() {
 				result.addInternalError(new(ConditionElseError), context, currentNode, ErrorDetails{})
 				result.mergeErrors(validationResultElse)
@@ -455,7 +490,7 @@ func (v *subSchema) validateCommon(currentSubSchema *subSchema, value interface{
 	result.incrementScore()
 }
 
-func (v *subSchema) validateArray(currentSubSchema *subSchema, value []interface{}, result *Result, context *JsonContext) {
+func (v *subSchema) validateArray(currentSubSchema *subSchema, value []interface{}, result *Result, context *JsonContext, extraSubSchemas []*subSchema) {
 
 	if internalLogEnabled {
 		internalLog("validateArray %s", context.String())
@@ -468,7 +503,7 @@ func (v *subSchema) validateArray(currentSubSchema *subSchema, value []interface
 	if currentSubSchema.itemsChildrenIsSingleSchema {
 		for i := range value {
 			subContext := NewJsonContext(strconv.Itoa(i), context)
-			validationResult := currentSubSchema.itemsChildren[0].subValidateWithContext(value[i], subContext)
+			validationResult := currentSubSchema.itemsChildren[0].subValidateWithContext(value[i], subContext, extraSubSchemas)
 			result.mergeErrors(validationResult)
 		}
 	} else {
@@ -479,7 +514,7 @@ func (v *subSchema) validateArray(currentSubSchema *subSchema, value []interface
 			// while we have both schemas and values, check them against each other
 			for i := 0; i != nbItems && i != nbValues; i++ {
 				subContext := NewJsonContext(strconv.Itoa(i), context)
-				validationResult := currentSubSchema.itemsChildren[i].subValidateWithContext(value[i], subContext)
+				validationResult := currentSubSchema.itemsChildren[i].subValidateWithContext(value[i], subContext, extraSubSchemas)
 				result.mergeErrors(validationResult)
 			}
 
@@ -496,7 +531,7 @@ func (v *subSchema) validateArray(currentSubSchema *subSchema, value []interface
 					additionalItemSchema := currentSubSchema.additionalItems.(*subSchema)
 					for i := nbItems; i != nbValues; i++ {
 						subContext := NewJsonContext(strconv.Itoa(i), context)
-						validationResult := additionalItemSchema.subValidateWithContext(value[i], subContext)
+						validationResult := additionalItemSchema.subValidateWithContext(value[i], subContext, extraSubSchemas)
 						result.mergeErrors(validationResult)
 					}
 				}
@@ -555,7 +590,7 @@ func (v *subSchema) validateArray(currentSubSchema *subSchema, value []interface
 		for i, v := range value {
 			subContext := NewJsonContext(strconv.Itoa(i), context)
 
-			validationResult := currentSubSchema.contains.subValidateWithContext(v, subContext)
+			validationResult := currentSubSchema.contains.subValidateWithContext(v, subContext, extraSubSchemas)
 			if validationResult.Valid() {
 				validatedOne = true
 				break
@@ -581,7 +616,7 @@ func (v *subSchema) validateArray(currentSubSchema *subSchema, value []interface
 	result.incrementScore()
 }
 
-func (v *subSchema) validateObject(currentSubSchema *subSchema, value map[string]interface{}, result *Result, context *JsonContext) {
+func (v *subSchema) validateObject(currentSubSchema *subSchema, value map[string]interface{}, result *Result, context *JsonContext, extraSubSchemas []*subSchema) {
 
 	if internalLogEnabled {
 		internalLog("validateObject %s", context.String())
@@ -626,6 +661,7 @@ func (v *subSchema) validateObject(currentSubSchema *subSchema, value map[string
 	}
 
 	// additionalProperty & patternProperty:
+	var additionalPropertiesErrors []string
 	for pk := range value {
 
 		// Check whether this property is described by "properties"
@@ -633,14 +669,53 @@ func (v *subSchema) validateObject(currentSubSchema *subSchema, value map[string
 		for _, spValue := range currentSubSchema.propertiesChildren {
 			if pk == spValue.property {
 				found = true
+				break
+			}
+		}
+		if !found && len(extraSubSchemas) != 0 {
+			// extraSubSchemas allow `"additionalProperties":false` to
+			// work with "oneOf"/"allOf"/"anyOf" by passing the other
+			// schemas that should be checked for valid properties.
+			//
+			// This additional check of the other schema properties only
+			// applies when "`additionalProperties:"false"` is set on the
+			// current sub-schema, otherwise it doesn't matter whether
+			// there are unspecified properties or not.
+			if additionalProperties, ok := currentSubSchema.additionalProperties.(bool); ok && !additionalProperties {
+			ESS:
+				for _, searchingSubSchema := range extraSubSchemas {
+					for _, spValue := range searchingSubSchema.propertiesChildren {
+						if pk == spValue.property {
+							found = true
+							break ESS
+						}
+					}
+					if searchingSubSchema.refSchema != nil {
+						for _, spValue := range searchingSubSchema.refSchema.propertiesChildren {
+							if pk == spValue.property {
+								found = true
+								break ESS
+							}
+						}
+					}
+				}
 			}
 		}
 
 		//  Check whether this property is described by "patternProperties"
-		ppMatch := v.validatePatternProperty(currentSubSchema, pk, value[pk], result, context)
+		ppMatch := v.validatePatternProperty(currentSubSchema, pk, value[pk], result, context, extraSubSchemas)
 
 		// If it is not described by neither "properties" nor "patternProperties" it must pass "additionalProperties"
 		if !found && !ppMatch {
+			additionalPropertiesErrors = append(additionalPropertiesErrors, pk)
+		}
+	}
+	if additionalPropertiesErrors != nil {
+		// For stable ordering of errors messages.
+		sort.Slice(additionalPropertiesErrors, func(i, j int) bool {
+			return additionalPropertiesErrors[i] < additionalPropertiesErrors[j]
+		})
+		for _, pk := range additionalPropertiesErrors {
 			switch ap := currentSubSchema.additionalProperties.(type) {
 			case bool:
 				// Handle the boolean case separately as it's cleaner to return a specific error than failing to pass the false schema
@@ -654,7 +729,7 @@ func (v *subSchema) validateObject(currentSubSchema *subSchema, value map[string
 
 				}
 			case *subSchema:
-				validationResult := ap.subValidateWithContext(value[pk], NewJsonContext(pk, context))
+				validationResult := ap.subValidateWithContext(value[pk], NewJsonContext(pk, context), extraSubSchemas)
 				result.mergeErrors(validationResult)
 			}
 		}
@@ -663,7 +738,7 @@ func (v *subSchema) validateObject(currentSubSchema *subSchema, value map[string
 	// propertyNames:
 	if currentSubSchema.propertyNames != nil {
 		for pk := range value {
-			validationResult := currentSubSchema.propertyNames.subValidateWithContext(pk, context)
+			validationResult := currentSubSchema.propertyNames.subValidateWithContext(pk, context, extraSubSchemas)
 			if !validationResult.Valid() {
 				result.addInternalError(new(InvalidPropertyNameError),
 					context,
@@ -678,7 +753,7 @@ func (v *subSchema) validateObject(currentSubSchema *subSchema, value map[string
 	result.incrementScore()
 }
 
-func (v *subSchema) validatePatternProperty(currentSubSchema *subSchema, key string, value interface{}, result *Result, context *JsonContext) bool {
+func (v *subSchema) validatePatternProperty(currentSubSchema *subSchema, key string, value interface{}, result *Result, context *JsonContext, extraSubSchemas []*subSchema) bool {
 
 	if internalLogEnabled {
 		internalLog("validatePatternProperty %s", context.String())
@@ -691,7 +766,7 @@ func (v *subSchema) validatePatternProperty(currentSubSchema *subSchema, key str
 		if matches, _ := regexp.MatchString(pk, key); matches {
 			validated = true
 			subContext := NewJsonContext(key, context)
-			validationResult := pv.subValidateWithContext(value, subContext)
+			validationResult := pv.subValidateWithContext(value, subContext, extraSubSchemas)
 			result.mergeErrors(validationResult)
 		}
 	}

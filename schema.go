@@ -31,6 +31,7 @@ import (
 	"math/big"
 	"reflect"
 	"regexp"
+	"sort"
 	"text/template"
 
 	"github.com/xeipuuv/gojsonreference"
@@ -1026,6 +1027,10 @@ func (d *Schema) parseProperties(documentNode interface{}, currentSchema *subSch
 			return err
 		}
 	}
+	// For stable error message ordering.
+	sort.Slice(currentSchema.propertiesChildren, func(i, j int) bool {
+		return currentSchema.propertiesChildren[i].property < currentSchema.propertiesChildren[j].property
+	})
 
 	return nil
 }
