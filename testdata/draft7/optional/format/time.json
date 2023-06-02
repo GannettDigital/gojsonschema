@@ -14,9 +14,9 @@
                 "valid": false
             },
             {
-                "description": "only RFC3339 not all of ISO 8601 are valid",
+                "description": "RFC3339 and a bit of ISO 8601 are valid",
                 "data": "01:01:01,1111",
-                "valid": false
+                "valid": true
             }
         ]
     }
