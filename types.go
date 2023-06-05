@@ -27,13 +27,14 @@ package gojsonschema
 
 // Type constants
 const (
-	TYPE_ARRAY   = `array`
-	TYPE_BOOLEAN = `boolean`
-	TYPE_INTEGER = `integer`
-	TYPE_NUMBER  = `number`
-	TYPE_NULL    = `null`
-	TYPE_OBJECT  = `object`
-	TYPE_STRING  = `string`
+	TYPE_ARRAY             = `array`
+	TYPE_BOOLEAN           = `boolean`
+	TYPE_INTEGER           = `integer`
+	TYPE_NUMBER            = `number`
+	TYPE_NULL              = `null`
+	TYPE_OBJECT            = `object`
+	TYPE_STRING            = `string`
+	TYPE_GRAPHQL_HYDRATION = `graphql-hydration` // Non-standard.
 )
 
 // JSON_TYPES hosts the list of type that are supported in JSON
@@ -50,8 +51,9 @@ func init() {
 		TYPE_NUMBER,
 		TYPE_NULL,
 		TYPE_OBJECT,
-		TYPE_STRING}
-
+		TYPE_STRING,
+		TYPE_GRAPHQL_HYDRATION,
+	}
 	SCHEMA_TYPES = []string{
 		TYPE_ARRAY,
 		TYPE_BOOLEAN,
